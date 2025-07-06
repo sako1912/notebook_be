@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 from app.services.rag_service import RAGService
 from app.services.s3 import S3Service
+from app.services.document_service import DocumentService
+from app.models.document import DocumentRequest
 import os
 from app.core.config import get_settings
 
@@ -10,9 +12,11 @@ router = APIRouter()
 settings = get_settings()
 rag_service = RAGService()
 s3_service = S3Service()
+document_service = DocumentService()
 
 class QuestionRequest(BaseModel):
     question: str
+    document_id: Optional[str] = None
     chat_history: Optional[List[tuple[str, str]]] = []
 
 @router.post("/process/{filename}")
@@ -56,9 +60,25 @@ async def process_document(filename: str):
 async def query_document(request: QuestionRequest):
     """
     처리된 문서에 대해 질문합니다.
+    documentId가 있으면 해당 문서만 검색, 없으면 전체 문서 검색
     """
     try:
-        response = rag_service.query(request.question, request.chat_history)
+        # documentId가 있으면 해당 문서가 존재하는지 확인
+        if request.document_id:
+            document = document_service.get_document_by_id(request.document_id)
+            if not document:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="문서를 찾을 수 없습니다."
+                )
+            
+            if document.status != "completed":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"문서 처리가 완료되지 않았습니다. 현재 상태: {document.status}"
+                )
+        
+        response = await rag_service.query(request.question, request.chat_history, request.document_id)
         
         if response["status"] == "error":
             raise HTTPException(
@@ -68,6 +88,7 @@ async def query_document(request: QuestionRequest):
 
         return {
             "answer": response["answer"],
+            "document_id": request.document_id,
             "source_documents": [
                 {
                     "content": doc.page_content,
@@ -77,6 +98,8 @@ async def query_document(request: QuestionRequest):
             ]
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

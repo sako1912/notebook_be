@@ -1,252 +1,285 @@
-from typing import Dict, Any, List
-from langchain.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader
-)
-from langchain.text_splitter import SemanticChunker
-from langchain.vectorstores import FAISS
-from langchain.embeddings import OpenAIEmbeddings
+from typing import Dict, Any, List, Optional, Tuple
+from langchain_aws import BedrockEmbeddings, ChatBedrock
 from langchain.embeddings import CacheBackedEmbeddings
 from langchain.storage import LocalFileStore
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
+from langchain.schema.messages import HumanMessage
 from pathlib import Path
 import os
-import pickle
-from app.core.config import get_settings
+import boto3
+import logging
 
+from app.core.config import get_settings
+from app.services.document_loader import DocumentLoader
+from app.services.vector_store_manager import VectorStoreManager
+from app.services.prompt_manager import PromptManager
+from langchain.chains import ConversationalRetrievalChain
+
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# 한국어 프롬프트 템플릿 정의
-CONDENSE_QUESTION_TEMPLATE = """주어진 대화 기록을 참고하여 최신 질문에 대한 독립적인 질문을 만들어주세요.
-
-대화 기록: {chat_history}
-최신 질문: {question}
-
-독립적인 질문:"""
-
-QA_TEMPLATE = """아래 제공된 컨텍스트를 사용하여 질문에 답변해주세요. 
-컨텍스트에서 답을 찾을 수 없다면, "주어진 문서에서 해당 정보를 찾을 수 없습니다."라고 답변해주세요.
-답변은 한국어로 해주세요.
-
-컨텍스트: {context}
-
-질문: {question}
-
-답변:"""
-
 class RAGService:
+    """
+    RAG (Retrieval-Augmented Generation) 서비스
+    
+    문서 기반 질답과 일반 대화를 모두 지원하는 AI 서비스
+    """
+    
     def __init__(self):
+        """RAG 서비스 초기화"""
+        self.bedrock_client = self._initialize_bedrock_client()
+        self.embeddings = self._initialize_embeddings()
+        self.vector_store_manager = VectorStoreManager(
+            embeddings=self.embeddings,
+            persist_dir=settings.faiss_index_dir
+        )
+        self.llm = self._initialize_llm()
+        
+        logger.info("RAG 서비스 초기화 완료")
+    
+    def _initialize_bedrock_client(self):
+        """AWS Bedrock 클라이언트 초기화"""
+        return boto3.client(
+            'bedrock-runtime',
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region
+        )
+    
+    def _initialize_embeddings(self):
+        """임베딩 모델 초기화 (캐시 포함)"""
         # 캐시 저장소 설정
         cache_dir = os.path.join(settings.base_dir, "embedding_cache")
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
         fs = LocalFileStore(cache_dir)
         
-        # 기본 임베딩 모델
-        underlying_embeddings = OpenAIEmbeddings()
+        # AWS Bedrock 임베딩 모델
+        underlying_embeddings = BedrockEmbeddings(
+            client=self.bedrock_client,
+            model_id="amazon.titan-embed-text-v2:0",  # 한국 리전에서 사용 가능
+            region_name=settings.aws_region
+        )
         
         # 캐시 지원 임베딩 생성
-        self.embeddings = CacheBackedEmbeddings.from_bytes_store(
+        return CacheBackedEmbeddings.from_bytes_store(
             underlying_embeddings,
             fs,
-            namespace="openai_embeddings_cache"
+            namespace="bedrock_embeddings_cache"
         )
-        
-        # SemanticChunker 초기화 - 캐시된 임베딩 사용
-        self.text_splitter = SemanticChunker(
-            embeddings=self.embeddings,
-            breakpoint_threshold=0.3,  # 의미적 유사도 임계값 (낮을수록 더 작은 청크)
-            min_chunk_size=200,        # 최소 청크 크기
-            max_chunk_size=1000,       # 최대 청크 크기
-            breakpoint_window_size=3   # 문장 간 유사도 비교 윈도우 크기
+    
+    def _initialize_llm(self):
+        """LLM 모델 초기화"""
+        return ChatBedrock(
+            client=self.bedrock_client,
+            model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",  # Claude 3.5 Sonnet 사용
+            model_kwargs={
+                "temperature": 0.1,
+                "max_tokens": 4000
+            }
         )
-        
-        self.persist_dir = settings.faiss_index_dir
-        self.vectorstore = None
-        self.qa_chain = None
-        
-        # 기존 인덱스가 있다면 로드
-        index_path = os.path.join(self.persist_dir, "faiss_index.pkl")
-        if os.path.exists(index_path):
-            with open(index_path, "rb") as f:
-                self.vectorstore = pickle.load(f)
-            self._initialize_qa_chain()
-
-    def process_document(self, file_path: str) -> Dict[str, Any]:
+    
+    def process_document(self, file_path: str, document_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        문서를 처리하고 벡터 저장소에 저장합니다.
+        문서를 처리하여 벡터 저장소에 저장
+        
+        Args:
+            file_path: 처리할 문서 파일 경로
+            document_id: 문서 ID (선택사항)
+        
+        Returns:
+            처리 결과 정보
         """
         try:
-            # 문서 로드 및 청크 분할
-            loader = self._get_loader(file_path)
-            documents = loader.load()
-            chunks = self.text_splitter.split_documents(documents)
+            # 파일 존재 여부 확인
+            if not os.path.exists(file_path):
+                return {
+                    "status": "error",
+                    "error": f"파일이 존재하지 않습니다: {file_path}"
+                }
             
-            # 청크 정보 로깅
-            chunk_sizes = [len(chunk.page_content) for chunk in chunks]
-            avg_size = sum(chunk_sizes) / len(chunk_sizes) if chunk_sizes else 0
+            # 지원하는 파일 형식인지 확인
+            if not DocumentLoader.is_supported(file_path):
+                return {
+                    "status": "error",
+                    "error": f"지원하지 않는 파일 형식입니다: {Path(file_path).suffix}"
+                }
             
-            # 벡터 저장소 생성 또는 업데이트
-            if self.vectorstore is None:
-                self.vectorstore = FAISS.from_documents(
-                    documents=chunks,
-                    embedding=self.embeddings
-                )
-            else:
-                self.vectorstore.add_documents(chunks)
+            # 문서 로드
+            documents = DocumentLoader.load_document(file_path)
             
-            # FAISS 인덱스 저장
-            index_path = os.path.join(self.persist_dir, "faiss_index.pkl")
-            with open(index_path, "wb") as f:
-                pickle.dump(self.vectorstore, f)
+            if not documents:
+                return {
+                    "status": "error",
+                    "error": "문서에서 텍스트를 추출할 수 없습니다"
+                }
             
-            # QA 체인 초기화
-            self._initialize_qa_chain()
+            # 벡터 저장소 생성
+            result = self.vector_store_manager.create_vectorstore(
+                documents=documents,
+                document_id=document_id
+            )
             
-            return {
-                "status": "success",
-                "chunk_count": len(chunks),
-                "average_chunk_size": int(avg_size),
-                "file_path": file_path
-            }
+            # 결과에 파일 경로 추가
+            if result["status"] == "success":
+                result["file_path"] = file_path
+                result["document_count"] = len(documents)
+                logger.info(f"문서 처리 완료: {file_path}")
+            
+            return result
             
         except Exception as e:
+            error_msg = f"문서 처리 중 오류 발생: {str(e)}"
+            logger.error(error_msg)
             return {
                 "status": "error",
-                "error": str(e),
+                "error": error_msg,
                 "file_path": file_path
             }
-
-    def query(self, question: str, chat_history: List = None) -> Dict[str, Any]:
+    
+    async def query(
+        self, 
+        question: str, 
+        chat_history: List[Tuple[str, str]] = None, 
+        document_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        질문에 대한 답변을 생성합니다.
-        1. 질문을 벡터화
-        2. 유사한 문서 검색
-        3. LLM으로 답변 생성
+        질문에 대한 답변 생성
+        
+        Args:
+            question: 사용자 질문
+            chat_history: 대화 기록 [(질문, 답변), ...]
+            document_id: 특정 문서 ID (선택사항)
+        
+        Returns:
+            답변 결과
         """
-        if self.qa_chain is None:
-            return {
-                "status": "error",
-                "error": "문서가 로드되지 않았습니다. 먼저 문서를 처리해주세요."
-            }
-            
         try:
             chat_history = chat_history or []
             
-            # 1. 질문 벡터화 및 관련 문서 검색
-            retriever = self.vectorstore.as_retriever(
-                search_kwargs={
-                    "k": 4,
-                    "score_threshold": 0.7
-                }
-            )
+            # 벡터 저장소 로드
+            vectorstore = self.vector_store_manager.load_vectorstore(document_id)
             
-            # 2. QA 체인 실행 (벡터화 -> 검색 -> 답변 생성)
-            response = self.qa_chain({
-                "question": question, 
+            if vectorstore is not None:
+                # RAG 방식: 문서 기반 질답
+                return await self._process_rag_query(question, chat_history, vectorstore)
+            else:
+                # 일반 대화 방식
+                return await self._process_general_query(question, chat_history)
+                
+        except Exception as e:
+            error_msg = f"질의 처리 중 오류 발생: {str(e)}"
+            logger.error(error_msg)
+            return {
+                "status": "error",
+                "error": error_msg
+            }
+    
+    async def _process_rag_query(self, question: str, chat_history: List[Tuple[str, str]], vectorstore) -> Dict[str, Any]:
+        """RAG 방식으로 질문 처리"""
+        try:
+            # QA 체인 생성
+            qa_chain = self._create_qa_chain(vectorstore)
+            
+            # 질문 실행
+            response = await qa_chain.ainvoke({
+                "question": question,
                 "chat_history": chat_history
             })
             
-            # 3. 검색된 문서와 답변 반환
+            logger.info(f"RAG 질의 처리 완료: {question[:50]}...")
+            
             return {
                 "status": "success",
                 "answer": response["answer"],
-                "source_documents": response["source_documents"],
+                "source_documents": response.get("source_documents", []),
                 "relevant_chunks": [
                     {
                         "content": doc.page_content,
                         "metadata": doc.metadata,
-                        "score": getattr(doc, 'score', None)  # 유사도 점수
+                        "score": getattr(doc, 'score', None)
                     }
-                    for doc in response["source_documents"]
-                ]
+                    for doc in response.get("source_documents", [])
+                ],
+                "query_type": "rag"
             }
             
         except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-
-    def _get_loader(self, file_path: str):
-        """
-        파일 확장자에 따른 적절한 로더를 반환합니다.
-        """
-        file_extension = Path(file_path).suffix.lower()
-        loaders = {
-            '.pdf': PyPDFLoader,
-            '.docx': Docx2txtLoader,
-            '.txt': TextLoader
-        }
-        
-        loader_class = loaders.get(file_extension)
-        if not loader_class:
-            raise ValueError(f"지원하지 않는 파일 형식입니다: {file_extension}")
+            raise Exception(f"RAG 질의 처리 실패: {str(e)}")
+    
+    async def _process_general_query(self, question: str, chat_history: List[Tuple[str, str]]) -> Dict[str, Any]:
+        """일반 대화 방식으로 질문 처리"""
+        try:
+            # 프롬프트 생성
+            prompt = PromptManager.create_general_prompt(question, chat_history)
             
-        if file_extension == '.txt':
-            return loader_class(file_path, encoding='utf-8')
-        return loader_class(file_path)
-
-    def _initialize_qa_chain(self):
-        """
-        QA 체인을 초기화합니다.
-        """
-        # 1. LLM 초기화
-        llm = ChatOpenAI(
-            temperature=0,  # 결정적인 답변을 위해 temperature를 0으로 설정
-            model_name="gpt-4"  # 더 정확한 답변을 위해 GPT-4 사용
-        )
+            # LLM 실행
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            
+            logger.info(f"일반 질의 처리 완료: {question[:50]}...")
+            
+            return {
+                "status": "success",
+                "answer": response.content,
+                "source_documents": [],
+                "relevant_chunks": [],
+                "query_type": "general"
+            }
+            
+        except Exception as e:
+            raise Exception(f"일반 질의 처리 실패: {str(e)}")
+    
+    def _create_qa_chain(self, vectorstore):
+        """RAG를 위한 QA 체인 생성 (메모리 없는 방식)"""
         
-        # 2. 프롬프트 템플릿 설정
-        condense_question_prompt = PromptTemplate(
-            template=CONDENSE_QUESTION_TEMPLATE,
-            input_variables=["chat_history", "question"]
-        )
-        
-        qa_prompt = PromptTemplate(
-            template=QA_TEMPLATE,
-            input_variables=["context", "question"]
-        )
-        
-        # 3. 메모리 설정
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
-        
-        # 4. QA 체인 생성
-        self.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=self.vectorstore.as_retriever(
+        # ConversationalRetrievalChain을 메모리 없이 생성
+        return ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=vectorstore.as_retriever(
                 search_kwargs={
-                    "k": 4,  # 상위 4개의 관련 문서 검색
-                    "score_threshold": 0.7  # 유사도 점수 임계값
+                    "k": 4,  # 상위 4개 문서 검색
+                    "score_threshold": 0.3  # 유사도 점수 임계값 (더 관대하게)
                 }
             ),
-            memory=memory,
-            condense_question_prompt=condense_question_prompt,
-            combine_docs_chain_kwargs={"prompt": qa_prompt},
+            condense_question_prompt=PromptManager.get_condense_question_prompt(),
+            combine_docs_chain_kwargs={"prompt": PromptManager.get_qa_prompt()},
             return_source_documents=True,
-            verbose=True  # 처리 과정 로깅
+            verbose=False
         )
+    
+    def get_document_list(self) -> List[str]:
+        """저장된 문서 ID 목록 반환"""
+        return self.vector_store_manager.list_document_ids()
+    
+    def delete_document(self, document_id: str) -> bool:
+        """특정 문서 삭제"""
+        return self.vector_store_manager.delete_vectorstore(document_id)
+    
+    def get_supported_extensions(self) -> List[str]:
+        """지원하는 파일 확장자 목록 반환"""
+        return list(DocumentLoader.SUPPORTED_EXTENSIONS)
 
-# 사용 예시:
+# 사용 예시
 """
 # RAG 서비스 초기화
 rag_service = RAGService()
 
-# 문서 처리
-result = rag_service.process_document("example.pdf")
-if result["status"] == "success":
-    print(f"문서가 성공적으로 처리되었습니다. 청크 수: {result['chunk_count']}")
+# 문서 처리 (특정 문서 ID로)
+result = rag_service.process_document("example.pdf", document_id="doc_001")
+print(f"처리 결과: {result}")
 
-# 질문하기
-chat_history = []
-response = rag_service.query("이 문서의 주요 내용은 무엇인가요?", chat_history)
-if response["status"] == "success":
-    print(f"답변: {response['answer']}")
-    # 다음 질문을 위해 대화 기록 업데이트
-    chat_history.append(("이 문서의 주요 내용은 무엇인가요?", response["answer"]))
+# 문서 기반 질문
+response = await rag_service.query(
+    question="이 문서의 주요 내용은 무엇인가요?",
+    document_id="doc_001"
+)
+print(f"답변: {response['answer']}")
+
+# 일반 질문 (문서 없이)
+response = await rag_service.query(
+    question="안녕하세요. 오늘 날씨가 어때요?"
+)
+print(f"답변: {response['answer']}")
+
+# 문서 목록 조회
+documents = rag_service.get_document_list()
+print(f"저장된 문서들: {documents}")
 """ 

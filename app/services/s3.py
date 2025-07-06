@@ -121,4 +121,71 @@ class S3Service:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="파일 삭제 중 오류가 발생했습니다."
-            ) 
+            )
+    
+    async def list_files_in_folder(self, folder_path: str) -> list:
+        """
+        S3 폴더 내의 파일 목록을 조회합니다.
+        """
+        try:
+            # 폴더 경로 정규화 (끝에 / 추가)
+            if not folder_path.endswith('/'):
+                folder_path += '/'
+            
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket_name,
+                Prefix=folder_path
+            )
+            
+            files = []
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    # 폴더 자체는 제외하고 파일만 추가
+                    if not obj['Key'].endswith('/'):
+                        files.append(obj['Key'])
+            
+            return files
+            
+        except ClientError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"S3 폴더 스캔 중 오류 발생: {str(e)}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="폴더 스캔 중 오류가 발생했습니다."
+            )
+    
+    async def get_file_size(self, s3_key: str) -> int:
+        """
+        S3 파일의 크기를 조회합니다.
+        """
+        try:
+            response = self.s3_client.head_object(
+                Bucket=self.bucket_name,
+                Key=s3_key
+            )
+            return response['ContentLength']
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="파일을 찾을 수 없습니다."
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"파일 크기 조회 중 오류 발생: {str(e)}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="파일 크기 조회 중 오류가 발생했습니다."
+            )
+    
+    async def download_file_by_key(self, s3_key: str) -> bytes:
+        """
+        S3 키로 파일을 다운로드합니다.
+        """
+        return await self.download_file(s3_key) 

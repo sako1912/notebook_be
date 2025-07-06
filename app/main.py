@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.files import router as upload_router
-from app.api.chat import router as chat_router
+from app.router import api_router
 
 app = FastAPI(title="Notebook ML API")
 
@@ -14,6 +13,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
-app.include_router(upload_router, prefix="/api", tags=["upload"])
-app.include_router(chat_router, prefix="/api/chat", tags=["chat"]) 
+# 통합된 라우터 등록
+app.include_router(api_router, prefix="/api") 
