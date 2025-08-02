@@ -17,7 +17,7 @@ async def get_documents(
     """문서 목록 조회"""
     try:
         documents = document_service.get_all_documents()
-        
+        print(f"documents:: {documents}")
         # 상태 필터 적용
         if status_filter:
             documents = [doc for doc in documents if doc.status == status_filter]

@@ -43,6 +43,7 @@ async def main():
     print("\n=== 질문하기 예시 ===")
     
     # 1. 특정 문서에 대한 질문
+    print("1. 특정 문서에 대한 질문")
     response = await rag_service.query(
         question="이 문서의 주요 내용은 무엇인가요?",
         document_id="my_document_001"
@@ -70,8 +71,9 @@ async def main():
     print(f"대화 맥락 포함 답변: {response['answer']}")
     
     # 4. 문서 없이 일반 질문
+    print("4. 문서 없이 일반 질문")
     response = await rag_service.query(
-        question="안녕하세요! 오늘 날씨가 어때요?"
+        question="안녕! 너는 어떤 ai인지 설명해줘(누가 만들었고 어떤 모델명인지 등)"
     )
     print(f"일반 질문 답변: {response['answer']}")
     print(f"답변 타입: {response['query_type']}")

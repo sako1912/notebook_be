@@ -6,6 +6,7 @@ from app.services.s3 import S3Service
 from app.services.document_service import DocumentService
 from app.models.document import DocumentRequest
 import os
+import re
 from app.core.config import get_settings
 
 router = APIRouter()
@@ -14,10 +15,22 @@ rag_service = RAGService()
 s3_service = S3Service()
 document_service = DocumentService()
 
+def clean_text(text: str) -> str:
+    """텍스트에서 제어 문자와 문제가 될 수 있는 문자들을 제거합니다."""
+    if not isinstance(text, str):
+        return str(text)
+    
+    # 제어 문자 제거 (탭, 개행 문자는 유지)
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    
+    # 연속된 공백을 하나로 줄이기
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
 class QuestionRequest(BaseModel):
     question: str
     document_id: Optional[str] = None
-    chat_history: Optional[List[tuple[str, str]]] = []
 
 @router.post("/process/{filename}")
 async def process_document(filename: str):
@@ -59,13 +72,15 @@ async def process_document(filename: str):
 @router.post("/query")
 async def query_document(request: QuestionRequest):
     """
-    처리된 문서에 대해 질문합니다.
-    documentId가 있으면 해당 문서만 검색, 없으면 전체 문서 검색
+    질의 시 documentId가 있으면 해당 문서만 검색, 없으면 전체 문서에서 검색합니다.
     """
     try:
+        # document_id가 빈 문자열이면 None으로 변환
+        document_id = request.document_id if request.document_id else None
+        
         # documentId가 있으면 해당 문서가 존재하는지 확인
-        if request.document_id:
-            document = document_service.get_document_by_id(request.document_id)
+        if document_id:
+            document = document_service.get_document_by_id(document_id)
             if not document:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -78,7 +93,9 @@ async def query_document(request: QuestionRequest):
                     detail=f"문서 처리가 완료되지 않았습니다. 현재 상태: {document.status}"
                 )
         
-        response = await rag_service.query(request.question, request.chat_history, request.document_id)
+        response = await rag_service.query(request.question, document_id=document_id)
+        print(f"response:: {response}")
+        #response:: {'status': 'success', 'answer': '안녕하세요! 반갑습니다. 오늘 하루는 어떠신가요? 무엇을 도와드릴까요?', 'source_documents': [], 'relevant_chunks': [], 'query_type': 'general'}
         
         if response["status"] == "error":
             raise HTTPException(
@@ -87,12 +104,14 @@ async def query_document(request: QuestionRequest):
             )
 
         return {
-            "answer": response["answer"],
-            "document_id": request.document_id,
+            "answer": clean_text(response["answer"]),
             "source_documents": [
                 {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata
+                    "content": clean_text(doc.page_content),
+                    "metadata": {
+                        key: clean_text(str(value)) if isinstance(value, str) else value
+                        for key, value in doc.metadata.items()
+                    }
                 }
                 for doc in response["source_documents"]
             ]
