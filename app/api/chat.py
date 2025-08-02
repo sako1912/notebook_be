@@ -1,7 +1,8 @@
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional, Dict
-from app.services.rag_service import RAGService
+from app.services.query_service import QueryService
+from app.services.rag_orchestrator import RAGOrchestrator  # RAGService → RAGOrchestrator
 from app.services.s3 import S3Service
 from app.services.document_service import DocumentService
 from app.models.document import DocumentRequest
@@ -11,7 +12,10 @@ from app.core.config import get_settings
 
 router = APIRouter()
 settings = get_settings()
-rag_service = RAGService()
+
+# 서비스 인스턴스들
+query_service = QueryService()  # 질의 처리용
+rag_service = RAGOrchestrator()  # RAGService → RAGOrchestrator
 s3_service = S3Service()
 document_service = DocumentService()
 
@@ -46,8 +50,8 @@ async def process_document(filename: str):
         with open(temp_path, "wb") as f:
             f.write(file_content)
 
-        # RAG 처리
-        result = rag_service.process_document(temp_path)
+        # RAG 처리 (upload_document 사용)
+        result = rag_service.upload_document(temp_path)
         
         if result["status"] == "error":
             raise HTTPException(
@@ -57,8 +61,9 @@ async def process_document(filename: str):
 
         return {
             "message": "문서가 성공적으로 처리되었습니다.",
-            "chunk_count": result["chunk_count"],
-            "file_path": result["file_path"]
+            "document_count": result.get("document_count", 0),
+            "total_documents": result.get("total_documents_in_db", 0),
+            "file_path": result.get("file_path", temp_path)
         }
 
     except Exception as e:
@@ -78,24 +83,11 @@ async def query_document(request: QuestionRequest):
         # document_id가 빈 문자열이면 None으로 변환
         document_id = request.document_id if request.document_id else None
         
-        # documentId가 있으면 해당 문서가 존재하는지 확인
-        if document_id:
-            document = document_service.get_document_by_id(document_id)
-            if not document:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="문서를 찾을 수 없습니다."
-                )
-            
-            if document.status != "completed":
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"문서 처리가 완료되지 않았습니다. 현재 상태: {document.status}"
-                )
-        
-        response = await rag_service.query(request.question, document_id=document_id)
-        print(f"response:: {response}")
-        #response:: {'status': 'success', 'answer': '안녕하세요! 반갑습니다. 오늘 하루는 어떠신가요? 무엇을 도와드릴까요?', 'source_documents': [], 'relevant_chunks': [], 'query_type': 'general'}
+        # QueryService를 통해 질의 처리
+        response = await query_service.process_query(
+            question=request.question,
+            document_id=document_id
+        )
         
         if response["status"] == "error":
             raise HTTPException(
@@ -105,15 +97,20 @@ async def query_document(request: QuestionRequest):
 
         return {
             "answer": clean_text(response["answer"]),
+            "document_id": document_id,
+            "query_type": response.get("query_type", "unknown"),
             "source_documents": [
                 {
-                    "content": clean_text(doc.page_content),
+                    "content": clean_text(doc.get("content", str(doc)) if isinstance(doc, dict) else (doc.page_content if hasattr(doc, 'page_content') else str(doc))),
                     "metadata": {
                         key: clean_text(str(value)) if isinstance(value, str) else value
-                        for key, value in doc.metadata.items()
+                        for key, value in (
+                            doc.get("metadata", {}) if isinstance(doc, dict) else 
+                            (doc.metadata if hasattr(doc, 'metadata') else {})
+                        ).items()
                     }
                 }
-                for doc in response["source_documents"]
+                for doc in response.get("source_documents", [])
             ]
         }
 

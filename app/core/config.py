@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     aws_region: str
     s3_bucket_name: str
     
+    # LLM 설정
+    llm_model: str = "claude-3.5-sonnet"  # 기본 모델
+    
     # 파일 저장 경로 설정
     base_dir: str = str(Path(__file__).resolve().parent.parent.parent)  # project root
     upload_dir: str = os.path.join(base_dir, "uploads")

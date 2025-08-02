@@ -3,7 +3,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     PyPDFLoader,
-    Docx2txtLoader,
+    UnstructuredWordDocumentLoader,
     TextLoader
 )
 import logging
@@ -56,7 +56,7 @@ class DocumentLoader:
         if file_extension == '.pdf':
             return PyPDFLoader(file_path)
         elif file_extension == '.docx':
-            return Docx2txtLoader(file_path)
+            return UnstructuredWordDocumentLoader(file_path)
         elif file_extension == '.txt':
             return TextLoader(file_path, encoding='utf-8')
         elif file_extension in ['.ppt', '.pptx']:

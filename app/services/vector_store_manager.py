@@ -1,212 +1,191 @@
 from typing import List, Optional, Dict, Any
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, TextSplitter
 from langchain.embeddings.base import Embeddings
 from pathlib import Path
 import os
-import pickle
 import logging
+from app.services.vector_store_base import VectorStoreBase, VectorStoreMetrics
 
 logger = logging.getLogger(__name__)
 
-class VectorStoreManager:
+class VectorStoreManager(VectorStoreBase):
     """
-    벡터 저장소 관리를 담당하는 클래스
+    간단한 벡터 저장소 관리자
+    - 하나의 통합된 벡터 DB
+    - 초기화 시 기존 DB 로드 또는 신규 생성
+    - 파일 업로드 시 벡터 DB에 추가
+    - 질의 시 관련 문서 검색
     """
     
-    def __init__(self, embeddings: Embeddings, persist_dir: str):
+    def __init__(self, 
+                embeddings: Embeddings, 
+                persist_dir: str,
+                text_splitter: TextSplitter):
+        """
+        Args:
+            embeddings: 임베딩 모델
+            persist_dir: 벡터 저장소 저장 경로
+            text_splitter: 텍스트 분할기. None인 경우 기본값 사용
+        """
         self.embeddings = embeddings
         self.persist_dir = persist_dir
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
+        self.index_path = os.path.join(persist_dir, "faiss_index")
+        
+        # 텍스트 분할기 설정
+        self.text_splitter = text_splitter
+        
+        # 메트릭스 초기화
+        self.metrics = VectorStoreMetrics()
         
         # 저장 디렉토리 생성
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
+        
+        # 벡터 DB 초기화
+        self.vectorstore = self._initialize_vectorstore()
+        logger.info("벡터 저장소 초기화 완료")
     
-    def create_vectorstore(self, documents: List[Document], document_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        문서로부터 벡터 저장소를 생성하고 저장
-        
-        Args:
-            documents: 처리할 문서 리스트
-            document_id: 문서 ID (제공되면 별도 인덱스 생성)
-        
-        Returns:
-            처리 결과 정보
-        """
-        try:
-            # 문서를 청크로 분할
-            chunks = self.text_splitter.split_documents(documents)
-            
-            if not chunks:
-                raise ValueError("문서에서 유효한 텍스트 청크를 생성할 수 없습니다.")
-            
-            # 벡터 저장소 생성
-            vectorstore = FAISS.from_documents(
-                documents=chunks,
-                embedding=self.embeddings
-            )
-            
-            # 저장 경로 결정
-            if document_id:
-                save_path = self._get_document_index_path(document_id)
-            else:
-                save_path = self._get_main_index_path()
-            
-            # 인덱스 저장
-            self._save_vectorstore(vectorstore, save_path)
-            
-            # 청크 정보 계산
-            chunk_sizes = [len(chunk.page_content) for chunk in chunks]
-            avg_size = sum(chunk_sizes) / len(chunk_sizes)
-            
-            logger.info(f"벡터 저장소 생성 완료: {save_path}, 청크 수: {len(chunks)}")
-            
-            return {
-                "status": "success",
-                "chunk_count": len(chunks),
-                "average_chunk_size": int(avg_size),
-                "save_path": save_path
-            }
-            
-        except Exception as e:
-            logger.error(f"벡터 저장소 생성 실패: {str(e)}")
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def load_vectorstore(self, document_id: Optional[str] = None) -> Optional[FAISS]:
-        """
-        벡터 저장소 로드
-        
-        Args:
-            document_id: 문서 ID (제공되면 해당 문서 인덱스 로드)
-        
-        Returns:
-            FAISS 벡터 저장소 또는 None
-        """
-        try:
-            if document_id:
-                load_dir = os.path.dirname(self._get_document_index_path(document_id))
-            else:
-                load_dir = os.path.dirname(self._get_main_index_path())
-            
-            # 먼저 FAISS 내장 방식으로 로드 시도
+    def _initialize_vectorstore(self) -> FAISS:
+        """벡터 저장소 초기화"""
+        with self.metrics.track_operation("initialize_vectorstore"):
             try:
-                vectorstore = FAISS.load_local(load_dir, self.embeddings, allow_dangerous_deserialization=True)
-                logger.info(f"벡터 저장소 로드 완료: {load_dir}")
-                return vectorstore
-            except Exception as e:
-                logger.warning(f"FAISS 내장 로드 실패: {e}")
-                
-                # 대안: pickle 파일로 로드
-                if document_id:
-                    load_path = self._get_document_index_path(document_id)
+                if os.path.exists(self.index_path):
+                    vectorstore = FAISS.load_local(
+                        self.index_path, 
+                        self.embeddings, 
+                        allow_dangerous_deserialization=True
+                    )
+                    logger.info(f"기존 벡터 저장소 로드 완료: {self.index_path}")
+                    return vectorstore
                 else:
-                    load_path = self._get_main_index_path()
-                
-                if not os.path.exists(load_path):
-                    logger.warning(f"벡터 저장소 파일이 존재하지 않습니다: {load_path}")
-                    return None
-                
-                with open(load_path, "rb") as f:
-                    vectorstore = pickle.load(f)
-                
-                # 임베딩 함수 복원
-                if hasattr(vectorstore, 'embedding_function'):
-                    vectorstore.embedding_function = self.embeddings
-                
-                logger.info(f"벡터 저장소 pickle 로드 완료: {load_path}")
-                return vectorstore
-            
-        except Exception as e:
-            logger.error(f"벡터 저장소 로드 실패: {str(e)}")
-            return None
+                    logger.info("기존 벡터 저장소가 없어 신규 생성합니다")
+                    return self._create_empty_vectorstore()
+                    
+            except Exception as e:
+                logger.error(f"벡터 저장소 로드 실패: {e}")
+                logger.info("새로운 빈 벡터 저장소를 생성합니다")
+                return self._create_empty_vectorstore()
     
-    def delete_vectorstore(self, document_id: str) -> bool:
-        """
-        특정 문서의 벡터 저장소 삭제
-        
-        Args:
-            document_id: 문서 ID
-        
-        Returns:
-            삭제 성공 여부
-        """
-        try:
-            doc_dir = os.path.join(self.persist_dir, document_id)
-            if os.path.exists(doc_dir):
-                import shutil
-                shutil.rmtree(doc_dir)
-                logger.info(f"벡터 저장소 삭제 완료: {doc_dir}")
-                return True
-            else:
-                logger.warning(f"삭제할 벡터 저장소가 존재하지 않습니다: {doc_dir}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"벡터 저장소 삭제 실패: {str(e)}")
-            return False
-    
-    def list_document_ids(self) -> List[str]:
-        """
-        저장된 문서 ID 목록 반환
-        
-        Returns:
-            문서 ID 리스트
-        """
-        try:
-            document_ids = []
-            for item in os.listdir(self.persist_dir):
-                item_path = os.path.join(self.persist_dir, item)
-                if os.path.isdir(item_path) and item != "__pycache__":
-                    index_path = os.path.join(item_path, "faiss_index.pkl")
-                    if os.path.exists(index_path):
-                        document_ids.append(item)
-            
-            return document_ids
-            
-        except Exception as e:
-            logger.error(f"문서 ID 목록 조회 실패: {str(e)}")
-            return []
-    
-    def _get_main_index_path(self) -> str:
-        """메인 인덱스 파일 경로 반환"""
-        return os.path.join(self.persist_dir, "faiss_index.pkl")
-    
-    def _get_document_index_path(self, document_id: str) -> str:
-        """문서별 인덱스 파일 경로 반환"""
-        doc_dir = os.path.join(self.persist_dir, document_id)
-        Path(doc_dir).mkdir(parents=True, exist_ok=True)
-        return os.path.join(doc_dir, "faiss_index.pkl")
-    
-    def _save_vectorstore(self, vectorstore: FAISS, save_path: str) -> None:
-        """벡터 저장소를 파일로 저장"""
-        try:
-            # FAISS 내장 저장 방식 사용
-            save_dir = os.path.dirname(save_path)
-            vectorstore.save_local(save_dir)
-            logger.debug(f"벡터 저장소 저장 완료: {save_dir}")
-        except Exception as e:
-            logger.error(f"벡터 저장소 저장 실패: {e}")
-            # 대안: pickle 사용 (임베딩 클라이언트 제거)
+    def _create_empty_vectorstore(self) -> FAISS:
+        """빈 벡터 저장소 생성"""
+        with self.metrics.track_operation("create_empty_vectorstore"):
             try:
-                import copy
-                vectorstore_copy = copy.deepcopy(vectorstore)
-                # 임베딩 함수에서 클라이언트 제거
-                if hasattr(vectorstore_copy, 'embedding_function'):
-                    if hasattr(vectorstore_copy.embedding_function, 'client'):
-                        vectorstore_copy.embedding_function.client = None
+                dummy_doc = Document(
+                    page_content="초기화용 더미 문서입니다.",
+                    metadata={"source": "system", "type": "dummy"}
+                )
                 
-                with open(save_path, "wb") as f:
-                    pickle.dump(vectorstore_copy, f)
-                logger.debug(f"벡터 저장소 pickle 저장 완료: {save_path}")
-            except Exception as e2:
-                logger.error(f"벡터 저장소 pickle 저장도 실패: {e2}")
-                raise 
+                vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
+                vectorstore.save_local(self.index_path)
+                
+                logger.info("빈 벡터 저장소 생성 완료")
+                return vectorstore
+                
+            except Exception as e:
+                logger.error(f"빈 벡터 저장소 생성 실패: {e}")
+                raise
+
+    def get_vectorstore(self) -> FAISS:
+        """벡터 저장소 인스턴스 반환"""
+        return self.vectorstore
+
+    async def add_documents(self, documents: List[Document], metadata: Optional[Dict] = None) -> Dict[str, Any]:
+        """문서를 벡터 저장소에 추가"""
+        with self.metrics.track_operation("add_documents"):
+            try:
+                # 문서를 청크로 분할
+                chunks = self.text_splitter.split_documents(documents)
+                
+                if not chunks:
+                    raise ValueError("문서에서 유효한 텍스트 청크를 생성할 수 없습니다")
+                
+                # 추가 메타데이터가 있으면 각 청크에 추가
+                if metadata:
+                    for chunk in chunks:
+                        chunk.metadata.update(metadata)
+                
+                # 기존 벡터 저장소에 새 문서 추가
+                new_vectorstore = FAISS.from_documents(chunks, self.embeddings)
+                self.vectorstore.merge_from(new_vectorstore)
+                
+                # 파일에 저장
+                await self._save_vectorstore_async()
+                
+                logger.info(f"문서 {len(chunks)}개 청크가 벡터 저장소에 추가되었습니다")
+                
+                return {
+                    "status": "success",
+                    "chunk_count": len(chunks),
+                    "message": f"{len(chunks)}개 청크가 성공적으로 추가되었습니다"
+                }
+                
+            except Exception as e:
+                logger.error(f"문서 추가 실패: {e}")
+                return {
+                    "status": "error",
+                    "error": str(e)
+                }
+
+    async def search_documents(self, query: str, k: int = 4, score_threshold: float = 0.3) -> List[Document]:
+        """질의와 관련된 문서 검색"""
+        with self.metrics.track_operation("search_documents"):
+            try:
+                retriever = self.vectorstore.as_retriever(
+                    search_kwargs={
+                        "k": k,
+                        "score_threshold": score_threshold
+                    }
+                )
+                
+                relevant_docs = await retriever.ainvoke(query)
+                
+                # 더미 문서 필터링
+                filtered_docs = [
+                    doc for doc in relevant_docs 
+                    if doc.metadata.get("type") != "dummy"
+                ]
+                
+                logger.info(f"검색 완료: {len(filtered_docs)}개 관련 문서 발견")
+                return filtered_docs
+                
+            except Exception as e:
+                logger.error(f"문서 검색 실패: {e}")
+                return []
+
+    async def _save_vectorstore_async(self) -> None:
+        """벡터 저장소를 파일에 비동기로 저장"""
+        with self.metrics.track_operation("save_vectorstore"):
+            try:
+                # 실제 저장은 동기 작업이지만, 비동기 컨텍스트에서 실행
+                import asyncio
+                await asyncio.to_thread(self.vectorstore.save_local, self.index_path)
+                logger.debug(f"벡터 저장소 저장 완료: {self.index_path}")
+            except Exception as e:
+                logger.error(f"벡터 저장소 저장 실패: {e}")
+                raise
+
+    async def get_document_count(self) -> int:
+        """저장된 문서 수 반환 (더미 문서 제외)"""
+        with self.metrics.track_operation("get_document_count"):
+            try:
+                total_docs = self.vectorstore.index.ntotal
+                return max(0, total_docs - 1)  # 더미 문서 1개 제외
+            except Exception as e:
+                logger.error(f"문서 수 조회 실패: {e}")
+                return 0
+
+    async def clear_all_documents(self) -> bool:
+        """모든 문서 삭제 (더미 문서만 남김)"""
+        with self.metrics.track_operation("clear_all_documents"):
+            try:
+                self.vectorstore = self._create_empty_vectorstore()
+                logger.info("모든 문서가 삭제되었습니다")
+                return True
+            except Exception as e:
+                logger.error(f"문서 삭제 실패: {e}")
+                return False
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """메트릭스 정보 반환"""
+        return self.metrics.get_metrics() 
